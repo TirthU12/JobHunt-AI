@@ -1,0 +1,97 @@
+# ─── WEB FRAMEWORK ───────────────────────────────────────
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic
+pydantic-settings
+
+# ─── DATABASE ────────────────────────────────────────────
+psycopg2-binary
+sqlalchemy
+alembic
+
+# ─── CACHE / TASK QUEUE ──────────────────────────────────
+redis
+celery
+flower
+
+# ─── ENVIRONMENT ─────────────────────────────────────────
+python-dotenv
+
+# ─── RESUME PARSING ──────────────────────────────────────
+pypdf2
+pdfplumber
+python-docx
+spacy
+nltk
+
+# ─── AI / LLM ────────────────────────────────────────────
+groq
+anthropic
+sentence-transformers
+scikit-learn
+numpy
+
+# ─── LANGCHAIN CORE ──────────────────────────────────────
+langchain
+langchain-core
+langchain-community
+langchain-groq
+langchain-anthropic
+langchain-openai
+langchain-text-splitters
+
+# ─── LANGGRAPH ───────────────────────────────────────────
+langgraph
+langgraph-checkpoint
+langgraph-checkpoint-postgres
+
+# ─── LANGCHAIN TOOLS & MEMORY ────────────────────────────
+langchain-experimental
+langsmith
+faiss-cpu
+chromadb
+tiktoken
+
+# ─── JOB SCRAPING ────────────────────────────────────────
+python-jobspy
+playwright
+beautifulsoup4
+httpx
+requests
+scrapy
+fake-useragent
+lxml
+html5lib
+
+# ─── SEARCH (no API key needed) ──────────────────────────
+duckduckgo-search
+google-api-python-client
+
+# ─── CONTACT FINDING ─────────────────────────────────────
+linkedin-api
+
+# ─── EMAIL SENDING ───────────────────────────────────────
+resend
+jinja2
+
+# ─── FILE HANDLING ───────────────────────────────────────
+python-magic
+pillow
+aiofiles
+
+# ─── AUTHENTICATION ──────────────────────────────────────
+python-jose[cryptography]
+passlib[bcrypt]
+
+# ─── ASYNC UTILITIES ─────────────────────────────────────
+aiohttp
+asyncpg
+
+# ─── DATA PROCESSING ─────────────────────────────────────
+pandas
+python-dateutil
+
+# ─── LOGGING & MONITORING ────────────────────────────────
+loguru
+sentry-sdk
