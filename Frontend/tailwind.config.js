@@ -8,10 +8,12 @@ export default {
   theme: {
     extend: {
       colors: {
-        primary: "#6366f1",
-        secondary: "#a855f7",
-        background: "#0f172a",
-        surface: "#1e293b",
+        primary: "#10B981", // Emerald Green Accent
+        secondary: "#34D399", // Lighter Emerald
+        background: "#121417", // Deep Charcoal
+        surface: "#1A1D21", // Slightly lighter charcoal for cards
+        silver: "#E2E8F0", // Sleek Silver
+        slateMuted: "#64748B", // Muted Slate
       }
     },
   },

@@ -33,3 +33,20 @@ export async function searchJobs(payload: any) {
 
   return response.json();
 }
+
+export async function findContacts(payload: any) {
+  const response = await fetch(`${API_URL}/find-contacts`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(payload)
+  });
+
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || "Failed to find contacts via API.");
+  }
+
+  return response.json();
+}

@@ -62,22 +62,73 @@ def load_jobs_node(state: MatcherState) -> MatcherState:
         elif table == "mnc_jobs":
             matches_table = "mnc_job_matches"
             job_id_col = "mnc_job_id"
+        elif table == "linkedin_jobs":
+            matches_table = "linkedin_job_matches"
+            job_id_col = "linkedin_job_id"
         
+        # Ensure matches table exists
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {matches_table} (
+                id VARCHAR(255) PRIMARY KEY,
+                user_id VARCHAR(255),
+                {job_id_col} VARCHAR(255),
+                match_score NUMERIC,
+                match_reason TEXT,
+                is_notified BOOLEAN DEFAULT false,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, {job_id_col})
+            )
+        """)
+        db.commit()
+        
+        # Pre-check/Create tables for LinkedIn if requested
+        if table == "linkedin_jobs":
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS linkedin_jobs (
+                    id VARCHAR(255) PRIMARY KEY,
+                    title VARCHAR(500),
+                    company VARCHAR(255),
+                    location VARCHAR(255),
+                    source VARCHAR(100),
+                    url VARCHAR(1000) UNIQUE,
+                    description TEXT,
+                    salary VARCHAR(255),
+                    job_type VARCHAR(100),
+                    raw_data JSONB,
+                    scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    match_score INTEGER DEFAULT 0,
+                    match_reason TEXT,
+                    apply_recommendation VARCHAR(255)
+                )
+            """)
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS {matches_table} (
+                    id VARCHAR(255) PRIMARY KEY,
+                    user_id VARCHAR(255),
+                    {job_id_col} VARCHAR(255),
+                    match_score INTEGER,
+                    match_reason TEXT,
+                    is_notified BOOLEAN DEFAULT FALSE,
+                    UNIQUE(user_id, {job_id_col})
+                )
+            """)
+            db.commit()
+
         # Get jobs not yet matched for this user
         cur.execute(f"""
             SELECT j.id, j.title, j.company, j.location,
-                   j.source, j.url, j.description, j.job_type
+                   j.source, j.url, j.description, j.job_type, j.scraped_at, j.raw_data
             FROM {table} j
             LEFT JOIN {matches_table} jm
-                ON j.id = jm.{job_id_col} AND jm.user_id = %s
+                ON j.id::varchar = jm.{job_id_col}::varchar AND jm.user_id::varchar = %s
             WHERE jm.id IS NULL
             ORDER BY j.scraped_at DESC
-            LIMIT 300
-        """, (state["user_id"],))
+            LIMIT 500
+        """, (str(state["user_id"]),))
 
         rows    = cur.fetchall()
         columns = ["id", "title", "company", "location",
-                   "source", "url", "description", "job_type"]
+                   "source", "url", "description", "job_type", "scraped_at", "raw_data"]
         jobs    = [dict(zip(columns, row)) for row in rows]
 
         print(f"   ✅ Loaded {len(jobs)} unmatched jobs")
@@ -124,28 +175,39 @@ def prefilter_node(state: MatcherState) -> MatcherState:
 
     # Embed all job descriptions
     scored = []
-    for job in jobs:
-        job_text = f"""
-        {job.get('title', '')}
-        {job.get('company', '')}
-        {job.get('description', '')[:500]}
-        {job.get('job_type', '')}
-        """
-        job_embedding    = embedder.encode(job_text, convert_to_tensor=True)
-        similarity_score = float(util.cos_sim(resume_embedding, job_embedding))
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
 
+    for job in jobs:
+        job_text = f"{job.get('title', '')} {job.get('company', '')} {job.get('description', '')[:500]}"
+        job_embedding = embedder.encode(job_text, convert_to_tensor=True)
+        similarity_score = float(util.cos_sim(resume_embedding, job_embedding)) * 100
+        
+        # Add a recency boost to ensure new jobs make it to the "top 150" pool
+        recency_boost = 0
+        scraped_at = job.get("scraped_at")
+        if scraped_at:
+            try:
+                # Handle naive vs aware
+                if scraped_at.tzinfo is None:
+                    delta = datetime.now() - scraped_at
+                else:
+                    delta = now - scraped_at
+                
+                hours = delta.total_seconds() / 3600
+                if hours <= 48: recency_boost = 15 # Boost recent jobs
+            except: pass
+            
         scored.append({
             **job,
-            "semantic_score": round(similarity_score * 100, 1)
+            "semantic_score": round(similarity_score + recency_boost, 1)
         })
 
-    # Sort by semantic score, keep top 100 for LLM deep analysis and skill relevancy
+    # Sort by boosted semantic score, keep top 150
     scored.sort(key=lambda x: x["semantic_score"], reverse=True)
-    top_candidates = scored[:100]
+    top_candidates = scored[:150]
 
-    print(f"   ✅ Pre-filter: {len(jobs)} → {len(top_candidates)} jobs")
-    print(f"   Top score: {top_candidates[0]['semantic_score']}% — {top_candidates[0]['title']} @ {top_candidates[0]['company']}")
-
+    print(f"   ✅ Pre-filter: {len(jobs)} → {len(top_candidates)} jobs (pool increased to ensure recency)")
     return {**state, "jobs": top_candidates}
 
 
@@ -154,132 +216,154 @@ def prefilter_node(state: MatcherState) -> MatcherState:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def score_job_with_llm(resume: dict, job: dict) -> dict:
-    """Score a single job against resume using LangChain + Groq."""
+    """
+    Score a single job against resume with strict prioritization:
+    1. Experience Fit (40%)
+    2. Skills & Keywords (40%)
+    3. Freshness/Recency (20%)
+    """
+    from datetime import datetime, timezone
+    import re
 
-    parser = JsonOutputParser()
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", """You are an expert recruiter and career coach.
-        Score how well a candidate matches a job posting.
-        CRITICAL RULE: Experience is highly weighted. If the job requires 5+ years and the candidate has only 1 year, dynamically slash their match_score. 
-        Likewise, do not give high scores if the candidate is severely underqualified.
-        Return ONLY valid JSON — no explanation, no markdown."""),
+    # ─── DATA EXTRACTION ──────────────────────────────────────────────────────
+    skills = [s.lower() for s in resume.get("skills", [])]
+    keywords = [k.lower() for k in resume.get("search_keywords", [])]
+    titles = [t.lower() for t in resume.get("job_titles", [])]
+    user_exp = float(resume.get("experience_years", 0))
 
-        ("human", """
-        Score this candidate for this job. Return JSON only:
-        {{
-          "match_score"         : <number 0-100>,
-          "match_reason"        : "<2 sentence explanation>",
-          "matching_skills"     : ["skill1", "skill2"],
-          "missing_skills"      : ["skill1", "skill2"],
-          "experience_fit"      : "<too junior / good fit / overqualified>",
-          "location_fit"        : "<yes / remote ok / relocation needed>",
-          "apply_recommendation": "<definitely apply / worth trying / skip>"
-        }}
+    job_title = job.get("title", "").lower()
+    job_desc = job.get("description", "").lower()
+    scraped_at = job.get("scraped_at")
 
-        CANDIDATE:
-        - Name            : {name}
-        - Skills          : {skills}
-        - Experience      : {experience} years
-        - Job Titles      : {titles}
-        - Location        : {location}
-        - Education       : {education}
+    # ─── 1. EXPERIENCE SCORE (MAX 40) ─────────────────────────────────────────
+    exp_score = 0
+    exp_fit = "unknown"
+    verdict = "Worth applying"
+    
+    # Try to find required years in description
+    exp_match = re.search(r'(\d+)(?:\+|-(\d+))?\s*years?', job_desc)
+    req_exp = None
+    if exp_match:
+        req_exp = float(exp_match.group(1))
+    
+    if req_exp is not None:
+        diff = user_exp - req_exp
+        if diff >= 0:
+            if diff <= 2: # Perfect fit
+                exp_score = 40
+                exp_fit = "Perfect match"
+            elif diff <= 5: # Good fit
+                exp_score = 35
+                exp_fit = "Good fit"
+            else: # Overqualified
+                exp_score = 25
+                exp_fit = "Overqualified"
+        else:
+            # Underqualified
+            if abs(diff) <= 1: # Slightly under
+                exp_score = 15
+                exp_fit = f"Slightly under ({req_exp}+ needed)"
+                verdict = "Stretch role"
+            else: # Far under
+                exp_score = 0
+                exp_fit = f"Requires {req_exp}+ years"
+                verdict = "Not recommended"
+    else:
+        # No experience mentioned - assume entry/mid (neutral)
+        exp_score = 30
+        exp_fit = "Entry/Mid level"
 
-        JOB:
-        - Title       : {job_title}
-        - Company     : {company}
-        - Location    : {job_location}
-        - Type        : {job_type}
-        - Description : {description}
-        """)
-    ])
+    # ─── 2. SKILLS & KEYWORDS SCORE (MAX 40) ──────────────────────────────────
+    matched_skills = [s for s in skills if s in job_desc or s in job_title]
+    matched_keywords = [k for k in keywords if k in job_desc or k in job_title]
+    
+    # Calculate percentage of skills matched
+    skill_match_ratio = len(matched_skills) / max(1, len(skills))
+    keyword_match_ratio = len(matched_keywords) / max(1, len(keywords))
+    
+    # Skill points (max 30) + Title bonus (max 10)
+    skill_points = (skill_match_ratio * 20) + (keyword_match_ratio * 10)
+    title_bonus = 10 if any(t in job_title for t in titles) else 0
+    
+    skills_score = skill_points + title_bonus
 
-    chain = prompt | llm | parser
+    # ─── 3. RECENCY SCORE (MAX 20) ───────────────────────────────────────────
+    recency_score = 0
+    if scraped_at:
+        try:
+            # Convert to naive or aware comparison
+            now = datetime.now(timezone.utc)
+            if scraped_at.tzinfo is None:
+                now = datetime.now() # naive
+            
+            delta = now - scraped_at
+            hours = delta.total_seconds() / 3600
+            
+            if hours <= 24: # Today
+                recency_score = 20
+            elif hours <= 48: # Yesterday
+                recency_score = 15
+            elif hours <= 168: # Within week
+                recency_score = 10
+            else:
+                recency_score = 5
+        except:
+            recency_score = 10
+    else:
+        recency_score = 10 # Default neutral
 
-    try:
-        result = chain.invoke({
-            "name"        : resume.get("name", ""),
-            "skills"      : ", ".join(resume.get("skills", [])[:15]),
-            "experience"  : resume.get("experience_years", 0),
-            "titles"      : ", ".join(resume.get("job_titles", [])),
-            "location"    : resume.get("location", ""),
-            "education"   : resume.get("education", ""),
-            "job_title"   : job.get("title", ""),
-            "company"     : job.get("company", ""),
-            "job_location": job.get("location", ""),
-            "job_type"    : job.get("job_type", ""),
-            "description" : job.get("description", "")[:1500]
-        })
-        return result
+    # ─── FINAL CALCULATION ────────────────────────────────────────────────────
+    total_score = exp_score + skills_score + recency_score
+    total_score = min(99, max(1, total_score)) # Keep within 1-99 range
 
-    except Exception as e:
-        print(f"   ⚠️  LLM scoring failed for {job.get('title')}: {e}")
-        # Fallback to semantic score only
-        return {
-            "match_score"         : job.get("semantic_score", 0),
-            "match_reason"        : "Scored by semantic similarity",
-            "matching_skills"     : [],
-            "missing_skills"      : [],
-            "experience_fit"      : "unknown",
-            "location_fit"        : "unknown",
-            "apply_recommendation": "worth trying"
-        }
+    reason = f"Experience: {exp_fit}. "
+    reason += f"Skills matched: {len(matched_skills)}/{len(skills)}. "
+    if recency_score >= 15: reason += "Freshly posted! "
+
+    return {
+        "match_score"         : int(total_score),
+        "match_reason"        : reason,
+        "matching_skills"     : matched_skills,
+        "missing_skills"      : [s for s in skills if s not in matched_skills],
+        "experience_fit"      : exp_fit,
+        "location_fit"        : "Matched" if resume.get("city","").lower() in job.get("location","").lower() else "Remote/Other",
+        "apply_recommendation": verdict
+    }
 
 
 def deep_score_node(state: MatcherState) -> MatcherState:
     """
-    Deep score top 30 jobs using LangChain + Groq.
-    Combines LLM score + semantic score for final ranking.
+    Deep score top 30 jobs using rule-based algorithm.
+    Combines skill, keyword, and experience score + semantic score for final ranking.
     Passes through remaining jobs as generic skill matches without deep AI cost.
     """
     import time
     
-    print(f"\n🤖 Deep scoring top 15 jobs with Groq LLaMA 3.3 to respect rate limits...")
+    print(f"\n🤖 Deep scoring top 30 jobs using rule-based algorithm...")
 
     resume         = state["resume"]
     jobs           = state["jobs"]
-    jobs_to_score  = jobs[:15]
-    jobs_unscored  = jobs[15:]
     scored_jobs    = []
 
-    for i, job in enumerate(jobs_to_score):
-        print(f"   [{i+1}/{len(jobs_to_score)}] Scoring: {job.get('title')} @ {job.get('company')}")
+    for i, job in enumerate(jobs):
+        # Get rule-based score
+        result = score_job_with_llm(resume, job)
 
-        # Get LLM score
-        llm_result = score_job_with_llm(resume, job)
-
-        # Combine: 60% LLM score + 40% semantic score
-        llm_score      = float(llm_result.get("match_score", 0))
-        semantic_score = float(job.get("semantic_score", 0))
-        final_score    = round((llm_score * 0.6) + (semantic_score * 0.4), 1)
+        final_score = float(result.get("match_score", 0))
 
         scored_job = {
             **job,
             "match_score"         : final_score,
-            "llm_score"           : llm_score,
-            "semantic_score"      : semantic_score,
-            "match_reason"        : llm_result.get("match_reason", ""),
-            "matching_skills"     : llm_result.get("matching_skills", []),
-            "missing_skills"      : llm_result.get("missing_skills", []),
-            "experience_fit"      : llm_result.get("experience_fit", ""),
-            "apply_recommendation": llm_result.get("apply_recommendation", "")
+            "llm_score"           : final_score,
+            "semantic_score"      : job.get("semantic_score", 0),
+            "match_reason"        : result.get("match_reason", ""),
+            "matching_skills"     : result.get("matching_skills", []),
+            "missing_skills"      : result.get("missing_skills", []),
+            "experience_fit"      : result.get("experience_fit", ""),
+            "apply_recommendation": result.get("apply_recommendation", "")
         }
         scored_jobs.append(scored_job)
-        time.sleep(2) # Prevent Groq Free Tier TPM burst limits!
         
-    for job in jobs_unscored:
-        scored_jobs.append({
-            **job,
-            "match_score"         : job.get("semantic_score", 0),
-            "llm_score"           : 0,
-            "semantic_score"      : float(job.get("semantic_score", 0)),
-            "match_reason"        : "Job is highly relevant to your skills (AI Semantic Pre-filter), but skipped deep analysis to save time.",
-            "matching_skills"     : [],
-            "missing_skills"      : [],
-            "experience_fit"      : "unknown",
-            "location_fit"        : "unknown",
-            "apply_recommendation": "evaluate manually"
-        })
-
     # Sort by final score
     scored_jobs.sort(key=lambda x: x["match_score"], reverse=True)
     print(f"   ✅ Scoring complete")
@@ -308,25 +392,44 @@ def save_matches_node(state: MatcherState) -> MatcherState:
         table = state.get("table_type", "jobs")
         matches_table = "job_matches"
         job_id_col = "job_id"
+        
         if table == "local_jobs":
             matches_table = "local_job_matches"
             job_id_col = "local_job_id"
         elif table == "mnc_jobs":
             matches_table = "mnc_job_matches"
             job_id_col = "mnc_job_id"
+        elif table == "linkedin_jobs":
+            matches_table = "linkedin_job_matches"
+            job_id_col = "linkedin_job_id"
+            
+        # Migration for linkedin_job_matches
+        if table == "linkedin_jobs":
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS {matches_table} (
+                    id VARCHAR(255) PRIMARY KEY,
+                    user_id UUID,
+                    {job_id_col} VARCHAR(255),
+                    match_score INTEGER,
+                    match_reason TEXT,
+                    is_notified BOOLEAN DEFAULT FALSE,
+                    UNIQUE(user_id, {job_id_col})
+                )
+            """)
+            db.commit()
             
         for job in scored_jobs:
             cur.execute(f"""
                 INSERT INTO {matches_table}
                     (id, user_id, {job_id_col}, match_score, match_reason, is_notified)
-                VALUES (%s, %s, %s, %s, %s, false)
+                VALUES (%s, %s::uuid, %s, %s, %s, false)
                 ON CONFLICT (user_id, {job_id_col}) DO UPDATE
                 SET match_score  = EXCLUDED.match_score,
                     match_reason = EXCLUDED.match_reason
             """, (
                 str(uuid.uuid4()),
-                user_id,
-                job["id"],
+                str(user_id),
+                str(job["id"]),
                 job["match_score"],
                 job.get("match_reason", "")
             ))
@@ -440,5 +543,16 @@ def match_mnc_jobs(user_id: str, parsed_resume: dict) -> list:
     pipeline = build_matcher_graph()
     state = pipeline.invoke({
         "user_id": user_id, "resume": parsed_resume, "jobs": [], "scored_jobs": [], "top_jobs": [], "table_type": "mnc_jobs", "error": None
+    })
+    return state["top_jobs"]
+
+def match_linkedin_jobs(user_id: str, parsed_resume: dict) -> list:
+    """Run linkedin jobs"""
+    print(f"\n{'='*60}")
+    print(f"🚀 AI Matcher Agent Started (LinkedIn)")
+    print(f"{'='*60}")
+    pipeline = build_matcher_graph()
+    state = pipeline.invoke({
+        "user_id": user_id, "resume": parsed_resume, "jobs": [], "scored_jobs": [], "top_jobs": [], "table_type": "linkedin_jobs", "error": None
     })
     return state["top_jobs"]

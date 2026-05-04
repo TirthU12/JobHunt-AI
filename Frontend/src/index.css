@@ -3,7 +3,70 @@
 @tailwind utilities;
 
 @layer base {
-  body {
-    @apply bg-slate-50 text-slate-900 antialiased dark:bg-background dark:text-slate-100 transition-colors duration-200;
+  :root {
+    --primary-gradient: linear-gradient(135deg, #10B981 0%, #059669 100%);
+    --glass-bg: rgba(255, 255, 255, 0.8);
+    --glass-border: rgba(255, 255, 255, 0.4);
+    --shadow-soft: 0 8px 32px 0 rgba(16, 185, 129, 0.05);
   }
+
+  .dark {
+    --glass-bg: rgba(26, 29, 33, 0.6);
+    --glass-border: rgba(255, 255, 255, 0.06);
+    --shadow-soft: 0 8px 32px 0 rgba(0, 0, 0, 0.4);
+  }
+
+  body {
+    @apply bg-slate-50 text-slate-900 antialiased selection:bg-primary/30;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  
+  .dark body {
+    @apply bg-background text-silver;
+  }
+}
+
+@layer utilities {
+  .glass-card {
+    @apply bg-white/70 dark:bg-slate-800/60 backdrop-blur-xl border border-white/40 dark:border-white/10 shadow-[var(--shadow-soft)] transition-all duration-300;
+  }
+  
+  .glass-card:hover {
+    @apply shadow-xl transform -translate-y-1 border-primary/30;
+  }
+
+  .text-gradient {
+    @apply bg-clip-text text-transparent bg-gradient-to-r from-primary to-secondary;
+  }
+
+  .bg-gradient-premium {
+    background: var(--primary-gradient);
+  }
+}
+
+@layer components {
+  /* Hide scrollbar for clean horizontal lists */
+  .hide-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+  .hide-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+}
+
+/* Smooth enter animations */
+@keyframes fade-in-up {
+  0% {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-fade-in-up {
+  animation: fade-in-up 0.6s cubic-bezier(0.16, 1, 0.3, 1) forwards;
 }

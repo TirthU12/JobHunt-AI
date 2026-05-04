@@ -6,7 +6,7 @@ import pandas as pd
 from datetime import datetime
 from dotenv import load_dotenv
 from jobspy import scrape_jobs
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
@@ -40,7 +40,7 @@ def scrape_global_jobs(job_title: str, location: str,
     # ── Board 1: LinkedIn + Indeed + Glassdoor ──────────────────────────────
     try:
         jobs_df = scrape_jobs(
-            site_name=["linkedin", "indeed", "glassdoor", "zip_recruiter","naukri","angel_co","monster","simplyhired","dice","careerjet","careerbuilder","caree"],
+            site_name=["linkedin", "indeed", "glassdoor", "zip_recruiter","naukri","monster","simplyhired","dice","careerjet","careerbuilder","caree"],
             search_term=job_title,
             location=location,
             results_wanted=results_wanted,
@@ -139,7 +139,7 @@ def scrape_local_jobs_india(job_title: str, location: str) -> list:
                         })
             else:
                 # Fallback to DDGS if keys are missing
-                from duckduckgo_search import DDGS
+                from ddgs import DDGS
                 with DDGS() as ddgs:
                     for r in ddgs.text(query, max_results=20):
                         results.append({
@@ -345,15 +345,43 @@ def save_jobs_to_db(jobs: list) -> int:
     cur = db.cursor()
     saved_count = 0
 
+    # Migration: ensure all columns exist
+    columns_to_check = {
+        "salary": "VARCHAR(255)",
+        "raw_data": "JSONB",
+        "scraped_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+    }
+    for col, col_type in columns_to_check.items():
+        try:
+            cur.execute(f"""
+                SELECT column_name FROM information_schema.columns 
+                WHERE table_name='jobs' AND column_name=%s
+            """, (col,))
+            if not cur.fetchone():
+                print(f"   🔧 Migrating: Adding {col} to jobs")
+                cur.execute(f"ALTER TABLE jobs ADD COLUMN {col} {col_type}")
+                db.commit()
+        except Exception as e:
+            print(f"   ⚠️ Migration error for {col}: {e}")
+            db.rollback()
+
+    db.commit()
     try:
+        errors = 0
+        error_samples = []
+
         for job in jobs:
             try:
+                cur.execute("SAVEPOINT sp")
                 cur.execute(
                     """INSERT INTO jobs
                        (id, title, company, location, source,
                         url, description, salary, job_type, raw_data)
                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                       ON CONFLICT (url) DO NOTHING""",
+                       ON CONFLICT (url) DO UPDATE SET
+                           title = EXCLUDED.title,
+                           company = EXCLUDED.company,
+                           scraped_at = CURRENT_TIMESTAMP""",
                     (
                         str(uuid.uuid4()),
                         job.get("title", "")[:500],
@@ -371,15 +399,24 @@ def save_jobs_to_db(jobs: list) -> int:
                         })
                     )
                 )
-                if cur.rowcount > 0:
-                    saved_count += 1
+                cur.execute("RELEASE SAVEPOINT sp")
+                saved_count += 1
 
             except Exception as e:
-                print(f"   ⚠️  Skip job '{job.get('title', '')}': {e}")
+                cur.execute("ROLLBACK TO SAVEPOINT sp")
+                errors += 1
+                if len(error_samples) < 3:
+                    error_samples.append(f"{job.get('title','')[:40]}: {str(e)[:80]}")
                 continue
 
         db.commit()
-        print(f"   ✅ Saved {saved_count} new jobs to DB")
+
+        if error_samples:
+            print(f"   ⚠️  Sample errors:")
+            for es in error_samples:
+                print(f"      {es}")
+
+        print(f"   ✅ Saved {saved_count} jobs to DB ({errors} errors)")
 
     except Exception as e:
         db.rollback()
@@ -441,9 +478,9 @@ def scrape_all_jobs(parsed_resume: dict) -> list:
     # Collect top queries from user data
     search_queries = []
     if parsed_resume.get("search_keywords"):
-        search_queries.extend(parsed_resume["search_keywords"][:2])
+        search_queries.extend(parsed_resume["search_keywords"][:10])
     if parsed_resume.get("job_titles"):
-        search_queries.extend(parsed_resume["job_titles"][:2])
+        search_queries.extend(parsed_resume["job_titles"][:10]) 
     
     # Deduplicate and remove empties
     search_queries = list(dict.fromkeys([q.strip() for q in search_queries if q.strip()]))
@@ -454,7 +491,6 @@ def scrape_all_jobs(parsed_resume: dict) -> list:
         search_queries = [f"{skills[0]} Developer" if skills else "Software Engineer"]
 
     # --- EXPERIENCE INJECTION ---
-    # To prevent grabbing 5+ year roles for 1 year candidates, directly append constraints softly
     exp_years = parsed_resume.get("experience_years", 0)
     if exp_years <= 1:
         search_queries = [q + " Entry Level" for q in search_queries]
@@ -467,15 +503,15 @@ def scrape_all_jobs(parsed_resume: dict) -> list:
 
     print(f"\n{'='*55}")
     print(f"🚀 Job Scraper Agent Started (Multi-Query + Exp)")
-    print(f"   Queries Queued: {search_queries[:2]}")
+    print(f"   Queries Queued: {search_queries[:10]}")
     print(f"   Location      : {location}")
     print(f"{'='*55}")
 
     all_jobs = []
     
-    # Restrict to maximum of 2 distinct queries to prevent API bans & excessive wait times
-    for rank, query in enumerate(search_queries[:2]):
-        print(f"\n   [+] Executing Pass {rank+1}/2 for query: '{query}'...")
+    # Search with up to 3 user keyword queries for pan-India coverage
+    for rank, query in enumerate(search_queries[:10]):
+        print(f"\n   [+] Executing Pass {rank+1}/{min(10, len(search_queries))} for query: '{query}'...")
         
         global_jobs_pan = scrape_global_jobs(query, "India", results_wanted=40)
         local_jobs_pan  = scrape_local_jobs_india(query, "India")

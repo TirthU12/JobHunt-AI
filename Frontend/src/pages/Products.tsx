@@ -18,7 +18,7 @@ export default function Products() {
   const navigate = useNavigate();
 
   // Pick up data injected by the Home page's FastAPI request
-  let stateData = location.state as { matches: any[], local_matches: any[], resume: any } | null;
+  let stateData = location.state as { matches: any[], local_matches: any[], mnc_matches: any[], resume: any } | null;
   
   // Persist jobs to SessionStorage to handle 'Back' navigation or refreshes
   if (stateData) {
@@ -31,16 +31,22 @@ export default function Products() {
   }
 
   // Tab selector State
-  const [activeTab, setActiveTab] = useState<"pan_india" | "local" | "all_relevant">("pan_india");
+  const [activeTab, setActiveTab] = useState<"pan_india" | "local" | "mnc" | "linkedin" | "all_relevant">("pan_india");
   
   // Decide which source of jobs to run through filtering logic
   const topJobs = stateData?.matches || mockJobs;
   const localJobs = stateData?.local_matches || [];
+  const mncJobs = stateData?.mnc_matches || [];
+  const linkedinJobs = (stateData as any)?.linkedin_matches || [];
   
-  let jobs = activeTab === "pan_india" ? topJobs : localJobs;
+  let jobs = activeTab === "pan_india" ? topJobs : 
+             activeTab === "local" ? localJobs : 
+             activeTab === "mnc" ? mncJobs : 
+             activeTab === "linkedin" ? linkedinJobs : [];
+             
   if (activeTab === "all_relevant") {
       // Merge all jobs and filter for ONLY those that didn't get deeply AI scored
-      const merged = [...topJobs, ...localJobs];
+      const merged = [...topJobs, ...localJobs, ...mncJobs, ...linkedinJobs];
       jobs = merged.filter((j: any) => j.llm_score === 0 || (j.match_score && j.match_score < 60));
   }
 
@@ -62,6 +68,8 @@ export default function Products() {
       filterOptions = ["All", "Pan India", "Remote"];
   } else if (activeTab === "local") {
       filterOptions = ["All", "Company Website", "Job Board"];
+  } else if (activeTab === "mnc") {
+      filterOptions = ["All", "Remote", "Company Website"];
   } else {
       filterOptions = ["All", "Remote"];
   }
@@ -88,6 +96,17 @@ export default function Products() {
            return job.source_type === "board" || job.source !== "company_website";
         }
     }
+
+    // MNC specific filters
+    if (activeTab === "mnc") {
+        if (activeFilter === "Remote") {
+            return jobLoc.includes("remote") || job.job_type?.toLowerCase().includes("remote") || job.title?.toLowerCase().includes("remote");
+        }
+        if (activeFilter === "Company Website") {
+            return job.source === "workday_scraper" || job.source === "custom_career_page";
+        }
+    }
+
     // All Relevant specific filters
     if (activeTab === "all_relevant") {
         if (searchCity && !jobLoc.includes(searchCity.toLowerCase())) {
@@ -105,6 +124,10 @@ export default function Products() {
 
   return (
     <div className="container mx-auto px-4 py-12">
+      <Link to="/" className="inline-flex items-center gap-2 text-sm text-slate-500 hover:text-primary dark:text-slate-400 dark:hover:text-primary mb-6 transition-colors">
+        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m15 18-6-6 6-6"/></svg>
+        Back to Home
+      </Link>
       <div className="flex flex-col md:flex-row justify-between items-start md:items-end mb-8 gap-4 border-b border-slate-200 dark:border-slate-800 pb-6">
         <div>
           <h1 className="text-3xl font-bold text-slate-900 dark:text-white mb-4">Recommended Jobs {userName}</h1>
@@ -120,6 +143,18 @@ export default function Products() {
                 className={`pb-2 border-b-2 font-medium transition-all ${activeTab === "local" ? "border-primary text-primary" : "border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300"}`}
              >
                  Local City Matches ({userCity || "Strict"})
+             </button>
+             <button 
+                onClick={() => { setActiveTab("mnc"); setActiveFilter("All"); setVisibleCount(6); }}
+                className={`pb-2 border-b-2 font-medium transition-all ${activeTab === "mnc" ? "border-primary text-primary" : "border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300"}`}
+             >
+                 Top MNC Matches
+             </button>
+             <button 
+                onClick={() => { setActiveTab("linkedin"); setActiveFilter("All"); setVisibleCount(6); }}
+                className={`pb-2 border-b-2 font-medium transition-all ${activeTab === "linkedin" ? "border-primary text-primary" : "border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300"}`}
+             >
+                 LinkedIn Matches
              </button>
              <button 
                 onClick={() => { setActiveTab("all_relevant"); setActiveFilter("All"); setVisibleCount(6); }}

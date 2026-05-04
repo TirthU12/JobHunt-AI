@@ -2,12 +2,34 @@ import { useParams, Link, useLocation } from "react-router-dom";
 import { Button } from "../components/ui/Button";
 import { ArrowLeft, Building, MapPin, Calendar, Clock, CheckCircle2 } from "lucide-react";
 import { motion } from "framer-motion";
+import { useState } from "react";
+import { findContacts } from "../lib/api";
 
 export default function Detail() {
   const { id } = useParams();
   const location = useLocation();
   const job = location.state?.job || null;
   
+  const [contacts, setContacts] = useState<any[]>([]);
+  const [companyPhone, setCompanyPhone] = useState<string>("");
+  const [loadingContacts, setLoadingContacts] = useState(false);
+
+  const handleFindContacts = async () => {
+    try {
+      setLoadingContacts(true);
+      const data = await findContacts(job);
+      setContacts(data.contacts || []);
+      if (data.company_phone) {
+        setCompanyPhone(data.company_phone);
+      }
+    } catch (e) {
+      console.error(e);
+      alert("Failed to find contacts.");
+    } finally {
+      setLoadingContacts(false);
+    }
+  };
+
   if (!job) {
      return <div className="p-8 text-center">Job not found. Please select a job from the products list.</div>;
   }
@@ -89,6 +111,45 @@ export default function Detail() {
                   <span className="block opacity-70 mb-1">Verdict:</span> {job.apply_recommendation || "Worth applying"}
                 </div>
               </div>
+            </div>
+            <div className="p-6 rounded-xl bg-slate-100 dark:bg-surface border border-slate-200 dark:border-slate-800 mt-6">
+              <h3 className="font-semibold text-slate-900 dark:text-white mb-4">HR & Employee Contacts</h3>
+              {companyPhone && (
+                <div className="mb-4 p-3 bg-white dark:bg-slate-800 rounded-lg border border-slate-200 dark:border-slate-700">
+                  <div className="text-xs text-slate-500 uppercase font-semibold tracking-wider mb-1">Company Phone</div>
+                  <div className="font-medium text-slate-800 dark:text-slate-200 flex items-center gap-2">
+                    📞 {companyPhone}
+                  </div>
+                </div>
+              )}
+              {contacts.length > 0 ? (
+                <div className="space-y-3">
+                  {contacts.map((c: any, i: number) => (
+                    <div key={i} className="text-sm border-b border-slate-200 dark:border-slate-700 pb-3 last:border-0 last:pb-0">
+                      <div className="font-medium text-slate-800 dark:text-slate-200">{c.name || "Unknown Name"}</div>
+                      <div className="text-slate-500 mb-1 flex items-center justify-between">
+                         <span>{c.role}</span>
+                         {c.priority === 1 && <span className="text-xs bg-primary/10 text-primary px-1.5 py-0.5 rounded">HR</span>}
+                      </div>
+                      {c.email && (
+                        <div className="text-blue-600 dark:text-blue-400">
+                          <a href={`mailto:${c.email}`}>{c.email}</a>
+                          {c.verified && <span className="ml-2 text-xs text-green-600">✓ Verified</span>}
+                        </div>
+                      )}
+                      {c.linkedin_url && (
+                        <a href={c.linkedin_url} target="_blank" rel="noreferrer" className="text-primary hover:underline text-xs mt-1 inline-block">
+                          LinkedIn Profile
+                        </a>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <Button onClick={handleFindContacts} disabled={loadingContacts} variant="outline" className="w-full">
+                  {loadingContacts ? "Searching the Web... (This takes 30-60s)" : "Find Contacts with AI"}
+                </Button>
+              )}
             </div>
           </div>
         </div>

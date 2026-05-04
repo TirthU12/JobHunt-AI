@@ -3,7 +3,7 @@ import { Navbar } from "./Navbar";
 
 export function Layout() {
   return (
-    <div className="min-h-screen flex flex-col pt-0">
+    <div className="min-h-screen flex flex-col pt-16">
       <Navbar />
       <main className="flex-1 flex flex-col w-full">
         <Outlet />

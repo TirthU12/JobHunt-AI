@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 
 from jobspy import scrape_jobs
 from ddgs import DDGS
-from ddgs.exceptions import DDGSException
+
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
@@ -33,6 +33,7 @@ class LocalJobState(TypedDict):
     job_title       : str
     city            : str
     skills          : List[str]
+    experience_years: float          # ADDED
     industry        : str
     local_companies : List[dict]     # found by company discovery
     board_jobs      : List[dict]     # from job boards city filter
@@ -54,13 +55,10 @@ def safe_ddg_search(query: str, max_results: int = 10,
             with DDGS() as ddgs:
                 results = ddgs.text(query, max_results=max_results)
                 return results or []
-        except DDGSException:
-            wait = (attempt + 1) * 5
-            print(f"   ⚠️  DDG rate limited. Waiting {wait}s...")
-            time.sleep(wait)
         except Exception as e:
-            print(f"   ⚠️  DDG error: {e}")
-            return []
+            wait = (attempt + 1) * 5
+            print(f"   ⚠️  DDG error (attempt {attempt+1}): {e}. Waiting {wait}s...")
+            time.sleep(wait)
     return []
 
 
@@ -81,12 +79,13 @@ def discover_local_companies_node(state: LocalJobState) -> LocalJobState:
     seen_domains  = set()
 
     # Multiple search queries to find different companies
+    job_title = state.get("job_title", "software")
     queries = [
         f"top {industry} companies in {city} India",
-        f"software IT companies in {city} Gujarat hiring",
-        f"best tech startups in {city} India 2024",
-        f"{industry} companies {city} careers jobs",
-        f"IT firms {city} India employee review",
+        f"{industry} startups in {city} India 2024 2025",
+        f"{industry} companies {city} careers hiring",
+        f"{job_title} companies in {city} India",
+        f"best {industry} firms {city} India",
     ]
 
     for query in queries:
@@ -287,113 +286,154 @@ def clean_title(title: str) -> str:
 # NODE 3 — SCRAPE COMPANY CAREER PAGES WITH PLAYWRIGHT
 # ══════════════════════════════════════════════════════════════════════════════
 
+def find_career_page_url(company_name: str, domain: str) -> str:
+    """Use DDG search to find the real career page URL for a company."""
+    queries = [
+        f"{company_name} careers page",
+        f"site:{domain} careers OR jobs",
+    ]
+    for q in queries:
+        results = safe_ddg_search(q, max_results=5)
+        for r in results:
+            href = r.get("href", "").lower()
+            if domain in href and any(w in href for w in ["/career", "/jobs", "/join", "/work-with", "/openings", "/hiring"]):
+                return r.get("href", "")
+        time.sleep(1)
+    return ""
+
+
 async def scrape_single_career_page(company: dict,
                                     job_title: str,
                                     city: str) -> list:
-    """Scrape a single company's career page using Playwright."""
+    """Scrape a single company's career page using Playwright with multi-strategy."""
     from playwright.async_api import async_playwright
 
     domain       = company.get("domain", "")
     company_name = company.get("name", "")
     jobs_found   = []
+    keywords     = [k.strip().lower() for k in job_title.split() if len(k.strip()) >= 2]
 
-    # Try common career page URLs
-    career_urls = [
-        f"https://{domain}/careers",
-        f"https://{domain}/jobs",
-        f"https://{domain}/career",
-        f"https://www.{domain}/careers",
-        f"https://www.{domain}/jobs",
-        f"https://{domain}/join-us",
-        f"https://{domain}/work-with-us",
-    ]
+    # Step 1: Find real career page via DDG search
+    career_url = find_career_page_url(company_name, domain)
+
+    # Step 2: Fallback to common career URL patterns
+    if not career_url:
+        career_urls = [
+            f"https://{domain}/careers",
+            f"https://www.{domain}/careers",
+            f"https://{domain}/jobs",
+            f"https://www.{domain}/jobs",
+            f"https://{domain}/career",
+            f"https://{domain}/join-us",
+        ]
+    else:
+        career_urls = [career_url]
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        page    = await browser.new_page()
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 800}
+        )
+        page = await context.new_page()
 
-        # Set realistic browser headers
-        await page.set_extra_http_headers({
-            "User-Agent"      : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-            "Accept-Language" : "en-US,en;q=0.9",
-        })
-
-        for career_url in career_urls:
+        for url in career_urls:
             try:
-                await page.goto(career_url, timeout=15000,
+                await page.goto(url, timeout=30000,
                                 wait_until="domcontentloaded")
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=8000)
+                except Exception:
+                    pass
                 await page.wait_for_timeout(2000)
 
-                # Check page has content
                 content = await page.content()
                 if len(content) < 500:
                     continue
 
-                # Try multiple CSS selectors for job listings
-                selectors = [
-                    ".job-listing", ".careers-item", ".job-card",
-                    ".position", ".opening", "article.job",
-                    "[class*='job']", "[class*='career']",
-                    "[class*='position']", "[class*='opening']",
-                    "li.job", "div.job", ".vacancy"
+                # Try search box
+                search_sels = [
+                    "input[placeholder*='earch']", "input[type='search']",
+                    "input[name='q']", "input[name='keyword']",
+                    "input[aria-label*='earch']", "input[id*='search']"
                 ]
+                for sel in search_sels:
+                    try:
+                        sb = await page.query_selector(sel)
+                        if sb and await sb.is_visible():
+                            await sb.fill(job_title)
+                            await page.keyboard.press("Enter")
+                            await page.wait_for_timeout(3000)
+                            break
+                    except Exception:
+                        continue
 
-                items = []
-                for selector in selectors:
-                    items = await page.query_selector_all(selector)
-                    if len(items) > 0:
-                        break
+                # Strategy A: Generic link extraction (most robust)
+                all_links = await page.evaluate("""() => {
+                    const results = [];
+                    const links = document.querySelectorAll('a');
+                    links.forEach(a => {
+                        const text = (a.innerText || '').trim();
+                        const href = a.href || '';
+                        const parent = a.closest('li, tr, div, article');
+                        const context = parent ? (parent.innerText || '').trim().substring(0, 400) : text;
+                        if (text.length > 5 && text.length < 200 && href) {
+                            results.push({title: text, href: href, context: context});
+                        }
+                    });
+                    return results;
+                }""")
 
-                if items:
-                    for item in items[:20]:
-                        try:
-                            text     = await item.inner_text()
-                            link_el  = await item.query_selector("a")
-                            href     = ""
-                            if link_el:
-                                href = await link_el.get_attribute("href") or ""
-                                if href and not href.startswith("http"):
-                                    href = f"https://{domain}{href}"
+                seen_titles = set()
+                for link in all_links:
+                    title = link.get("title", "").strip()
+                    href  = link.get("href", "")
+                    ctx   = link.get("context", "").lower()
 
-                            if text and len(text) > 5:
-                                jobs_found.append({
-                                    "id"         : str(uuid.uuid4()),
-                                    "title"      : clean_title(text.split("\n")[0][:200]),
-                                    "company"    : company_name,
-                                    "location"   : city,
-                                    "source"     : "company_website",
-                                    "url"        : href or career_url,
-                                    "description": text[:3000],
-                                    "salary"     : "",
-                                    "job_type"   : "",
-                                    "is_local"   : True,
-                                    "city"       : city,
-                                    "raw_data"   : {"scraped_from": career_url}
-                                })
-                        except Exception:
-                            continue
+                    if not title or title in seen_titles:
+                        continue
 
-                # If no structured items — use AI to extract from HTML
+                    title_lower = title.lower()
+                    skip_words = ["login", "sign in", "cookie", "privacy",
+                                  "about us", "contact us", "blog", "faq", "help"]
+                    if any(sw in title_lower for sw in skip_words):
+                        continue
+
+                    if any(k in title_lower or k in ctx for k in keywords):
+                        seen_titles.add(title)
+                        jobs_found.append({
+                            "id"         : str(uuid.uuid4()),
+                            "title"      : clean_title(title),
+                            "company"    : company_name,
+                            "location"   : city,
+                            "source"     : "company_website",
+                            "url"        : href or url,
+                            "description": link.get("context", "")[:3000],
+                            "salary"     : "",
+                            "job_type"   : "",
+                            "is_local"   : True,
+                            "city"       : city,
+                            "raw_data"   : {"scraped_from": url}
+                        })
+                        if len(jobs_found) >= 25:
+                            break
+
+                # Strategy B: AI fallback
                 if not jobs_found:
-                    page_text = await page.evaluate(
-                        "document.body.innerText"
-                    )
-                    if page_text and len(page_text) > 200:
+                    page_text = await page.evaluate("document.body.innerText")
+                    if page_text and len(page_text.strip()) > 200:
                         ai_jobs = extract_jobs_with_ai(
-                            page_text[:3000],
-                            company_name,
-                            city,
-                            career_url
+                            page_text[:4000], company_name, city, url
                         )
                         jobs_found.extend(ai_jobs)
 
                 if jobs_found:
                     print(f"      ✅ {company_name}: {len(jobs_found)} jobs")
-                    break  # found jobs, stop trying other URLs
+                    break
 
-            except Exception as e:
-                continue  # try next URL
+            except Exception:
+                continue
 
         await browser.close()
 
@@ -547,6 +587,65 @@ def merge_and_deduplicate_node(state: LocalJobState) -> LocalJobState:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# NODE 4.5 — RELEVANCE SCORING (Skills + Keywords + Experience)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def score_local_jobs_node(state: LocalJobState) -> LocalJobState:
+    """Score and rank local jobs based on Experience (40%), Skills (40%), and Recency (20%)."""
+    jobs = state["all_local_jobs"]
+    skills = [s.lower() for s in state.get("skills", [])]
+    user_exp = float(state.get("experience_years", 0)) # Assuming this might be in state, if not use default
+
+    if not jobs:
+        return state
+
+    print(f"\n🎯 Scoring {len(jobs)} local jobs by relevance (Exp/Skills/Recency)...")
+
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    scored = []
+
+    for job in jobs:
+        title = job.get("title", "").lower()
+        desc = job.get("description", "").lower()
+        text = title + " " + desc
+
+        # ── 1. Experience Score (40 pts) ──
+        exp_score = 0
+        exp_match = re.search(r'(\d+)(?:\+|-(\d+))?\s*years?', desc)
+        if exp_match:
+            req_exp = float(exp_match.group(1))
+            diff = user_exp - req_exp
+            if diff >= 0:
+                exp_score = 40 if diff <= 2 else 30
+            else:
+                exp_score = 10 if abs(diff) <= 1 else 0
+        else:
+            exp_score = 25 # Neutral
+
+        # ── 2. Skills Score (40 pts) ──
+        matched_skills = [s for s in skills if s in text]
+        skill_ratio = len(matched_skills) / max(1, len(skills))
+        skills_score = (skill_ratio * 30) + (10 if any(s in title for s in skills) else 0)
+
+        # ── 3. Recency Score (20 pts) ──
+        # Local jobs usually fresh from JobSpy, but let's check
+        recency_score = 20 # Default fresh for local board scrapes
+
+        total_score = exp_score + skills_score + recency_score
+        job["relevance_score"] = int(min(99, total_score))
+        job["matched_skills"] = matched_skills
+        scored.append(job)
+
+    # Sort and keep top 50
+    scored.sort(key=lambda x: x.get("relevance_score", 0), reverse=True)
+    top_jobs = scored[:50]
+
+    print(f"   ✅ Top score: {top_jobs[0]['relevance_score']}% — {top_jobs[0]['title']}")
+    return {**state, "all_local_jobs": top_jobs}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # NODE 5 — SAVE LOCAL JOBS TO POSTGRESQL
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -565,8 +664,51 @@ def save_local_jobs_node(state: LocalJobState) -> LocalJobState:
     saved = 0
 
     try:
+        # Create table if not exists
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS local_jobs (
+                id VARCHAR(255) PRIMARY KEY,
+                title VARCHAR(500),
+                company VARCHAR(255),
+                location VARCHAR(255),
+                source VARCHAR(100),
+                source_type VARCHAR(100),
+                url VARCHAR(1000) UNIQUE,
+                description TEXT,
+                salary VARCHAR(255),
+                job_type VARCHAR(100),
+                city VARCHAR(100),
+                raw_data JSONB,
+                scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        db.commit()
+
+        # Migration: ensure all columns exist
+        columns_to_check = {
+            "salary": "VARCHAR(255)",
+            "raw_data": "JSONB",
+            "scraped_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+        }
+        for col, col_type in columns_to_check.items():
+            try:
+                cur.execute(f"""
+                    SELECT column_name FROM information_schema.columns 
+                    WHERE table_name='local_jobs' AND column_name=%s
+                """, (col,))
+                if not cur.fetchone():
+                    print(f"   🔧 Migrating: Adding {col} to local_jobs")
+                    cur.execute(f"ALTER TABLE local_jobs ADD COLUMN {col} {col_type}")
+                    db.commit()
+            except Exception as e:
+                print(f"   ⚠️ Migration error for {col}: {e}")
+                db.rollback()
+
+        db.commit()
+
         for job in jobs:
             try:
+                cur.execute("SAVEPOINT sp")
                 cur.execute("""
                     INSERT INTO local_jobs
                         (id, title, company, location, source, source_type,
@@ -574,7 +716,10 @@ def save_local_jobs_node(state: LocalJobState) -> LocalJobState:
                          city, raw_data)
                     VALUES
                         (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    ON CONFLICT (url) DO NOTHING
+                    ON CONFLICT (url) DO UPDATE SET
+                        title = EXCLUDED.title,
+                        company = EXCLUDED.company,
+                        scraped_at = CURRENT_TIMESTAMP
                 """, (
                     str(uuid.uuid4()),
                     job.get("title", "")[:500],
@@ -589,15 +734,16 @@ def save_local_jobs_node(state: LocalJobState) -> LocalJobState:
                     job.get("city", "")[:100],
                     json.dumps(job.get("raw_data", {}))
                 ))
-                if cur.rowcount > 0:
-                    saved += 1
+                cur.execute("RELEASE SAVEPOINT sp")
+                saved += 1
 
             except Exception as e:
+                cur.execute("ROLLBACK TO SAVEPOINT sp")
                 print(f"   ⚠️  Skip: {job.get('title','')} — {e}")
                 continue
 
         db.commit()
-        print(f"   ✅ Saved {saved} new local jobs")
+        print(f"   ✅ Saved/Updated {saved} local jobs")
 
     except Exception as e:
         db.rollback()
@@ -661,17 +807,19 @@ def build_local_job_graph():
     graph.add_node("scrape_boards"      , scrape_local_boards_node)
     graph.add_node("scrape_career_pages", scrape_career_pages_node)
     graph.add_node("merge_deduplicate"  , merge_and_deduplicate_node)
+    graph.add_node("score_jobs"         , score_local_jobs_node)
     graph.add_node("save_jobs"          , save_local_jobs_node)
     graph.add_node("summary"            , summary_node)
 
     # Entry point
     graph.set_entry_point("discover_companies")
 
-    # Edges — discover → both scrapers run in sequence
+    # Edges
     graph.add_edge("discover_companies" , "scrape_boards")
     graph.add_edge("scrape_boards"      , "scrape_career_pages")
     graph.add_edge("scrape_career_pages", "merge_deduplicate")
-    graph.add_edge("merge_deduplicate"  , "save_jobs")
+    graph.add_edge("merge_deduplicate"  , "score_jobs")
+    graph.add_edge("score_jobs"         , "save_jobs")
     graph.add_edge("save_jobs"          , "summary")
     graph.add_edge("summary"            , END)
 
@@ -735,6 +883,7 @@ def find_local_jobs(parsed_resume: dict) -> list:
             "job_title"      : query,
             "city"           : city,
             "skills"         : skills,
+            "experience_years": float(parsed_resume.get("experience_years", 0)),
             "industry"       : industry,
             "local_companies": [],
             "board_jobs"     : [],
@@ -749,7 +898,7 @@ def find_local_jobs(parsed_resume: dict) -> list:
     seen_urls = set()
     global_unique = []
     for job in aggregated_local_jobs:
-        url = job.get("job_url")
+        url = job.get("url")
         if url and url not in seen_urls:
             seen_urls.add(url)
             global_unique.append(job)
