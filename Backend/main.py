@@ -104,29 +104,29 @@ async def search_jobs(payload: Dict[str, Any] = Body(...)):
         jobs = scrape_all_jobs(result)
         top_jobs = match_jobs(user_id, result)
         
-        # # 4. Spin up localized scraping for target city
-        # from agents.local_city_job_scraper import find_local_jobs
-        # local_jobs_raw = find_local_jobs(result)
+        # 4. Spin up localized scraping for target city
+        from agents.local_city_job_scraper import find_local_jobs
+        local_jobs_raw = find_local_jobs(result)
         
-        # # 5. Iteratively evaluate localized jobs specifically against profile
-        # from agents.ai_matcher import match_local_jobs
-        # top_local_jobs = match_local_jobs(user_id, result)
+        # 5. Iteratively evaluate localized jobs specifically against profile
+        from agents.ai_matcher import match_local_jobs
+        top_local_jobs = match_local_jobs(user_id, result)
         
-        # # 6. Spin up MNC career page scraping
-        # from agents.career_scraper import fetch_mnc_jobs
-        # mnc_jobs_raw = await fetch_mnc_jobs(result)
+        # 6. Spin up MNC career page scraping
+        from agents.career_scraper import fetch_mnc_jobs
+        mnc_jobs_raw = await fetch_mnc_jobs(result)
         
-        # # 7. Evaluate MNC jobs
-        # from agents.ai_matcher import match_mnc_jobs
-        # top_mnc_jobs = match_mnc_jobs(user_id, result)
+        # 7. Evaluate MNC jobs
+        from agents.ai_matcher import match_mnc_jobs
+        top_mnc_jobs = match_mnc_jobs(user_id, result)
         
         return {
             "message": "Jobs scraped and AI dynamically matched successfully",
             "data": result,
             "jobs_scraped_amount": len(jobs) + len(linkedin_jobs_raw),
             "top_matched_jobs": top_jobs,
-            # "top_local_jobs": top_local_jobs,
-            # "top_mnc_jobs": top_mnc_jobs,
+            "top_local_jobs": top_local_jobs,
+            "top_mnc_jobs": top_mnc_jobs,
             "top_linkedin_jobs": top_linkedin_jobs
         }
     except Exception as e:
